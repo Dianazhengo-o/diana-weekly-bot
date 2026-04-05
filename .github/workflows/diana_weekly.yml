@@ -1,0 +1,24 @@
+name: 黛安娜的科技蟹蟹水果報
+
+on:
+  schedule:
+    - cron: "0 10 * * 5"   # 每週五 UTC 10:00 = 台灣時間 18:00
+  workflow_dispatch:         # 可在 GitHub 網頁手動觸發（測試用）
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install anthropic requests -q
+
+      - name: 執行週報機器人
+        env:
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python weekly_news.py
