@@ -1,0 +1,8 @@
+# 確保金鑰檔案不會被上傳
+.env
+*.env
+config.py
+secrets.py
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
