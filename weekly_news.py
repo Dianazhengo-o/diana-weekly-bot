@@ -8,179 +8,53 @@ ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 TAIWAN_TZ = timezone(timedelta(hours=8))
 
-# ── RSS 來源────────────────────────────────────────────
-RSS_FEEDS = [
-    ("TechCrunch",  "https://techcrunch.com/feed/"),
-    ("The Verge",   "https://www.theverge.com/rss/index.xml"),
-    ("Wired",       "https://www.wired.com/feed/rss"),
-    ("Ars Technica","https://feeds.arstechnica.com/arstechnica/index"),
-    ("iThome",      "https://www.ithome.com.tw/rss"),
-]
+RSS_FEEDS = {
+    "TechCrunch":  "https://techcrunch.com/feed/",
+    "The Verge":   "https://www.theverge.com/rss/index.xml",
+    "Wired":       "https://www.wired.com/feed/rss",
+    "Ars Technica":"https://feeds.arstechnica.com/arstechnica/index",
+    "iThome":      "https://www.ithome.com.tw/rss",
+}
 
-def fetch_rss_articles(max_per_feed=3):
-    """從各 RSS 抓最新文章，回傳標題 + 網址清單"""
-    articles = []
-    headers = {"User-Agent": "Mozilla/5.0"}
+# ── Tool 實作（Claude 可以呼叫的函式）────────────────────
 
-    for source, url in RSS_FEEDS:
-        try:
-            resp = requests.get(url, timeout=8, headers=headers)
-            root = ET.fromstring(resp.content)
-
-            # 同時支援 RSS 2.0 和 Atom 格式
-            items = root.findall(".//item") or root.findall(".//{http://www.w3.org/2005/Atom}entry")
-
-            count = 0
-            for item in items:
-                title = (item.findtext("title") or
-                         item.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
-                link  = (item.findtext("link") or
-                         item.findtext("{http://www.w3.org/2005/Atom}link") or "").strip()
-
-                # Atom 的 link 有時是屬性而非文字
-                if not link:
-                    link_el = item.find("{http://www.w3.org/2005/Atom}link")
-                    if link_el is not None:
-                        link = link_el.get("href", "").strip()
-
-                if title and link.startswith("https://"):
-                    articles.append(f"{title} | {link} | {source}")
-                    count += 1
-                    if count >= max_per_feed:
-                        break
-
-            print(f"✓ {source}：抓到 {count} 篇")
-        except Exception as e:
-            print(f"✗ {source} 失敗：{e}")
-
-    return articles
+def tool_fetch_rss(source: str) -> str:
+    """抓取單一來源的 RSS 文章"""
+    url = RSS_FEEDS.get(source)
+    if not url:
+        available = ", ".join(RSS_FEEDS.keys())
+        return f"找不到來源：{source}。可用來源：{available}"
+    try:
+        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        root = ET.fromstring(resp.content)
+        items = (root.findall(".//item") or
+                 root.findall(".//{http://www.w3.org/2005/Atom}entry"))
+        results = []
+        for item in items[:5]:
+            title = (item.findtext("title") or
+                     item.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
+            link  = (item.findtext("link") or
+                     item.findtext("{http://www.w3.org/2005/Atom}link") or "").strip()
+            if not link:
+                link_el = item.find("{http://www.w3.org/2005/Atom}link")
+                if link_el is not None:
+                    link = link_el.get("href", "").strip()
+            if title and link.startswith("https://"):
+                results.append(f"{title} | {link}")
+        return "\n".join(results) if results else f"{source}：無法取得文章"
+    except Exception as e:
+        return f"{source} 失敗：{e}"
 
 
-def pick_top5_with_claude(articles):
-    """讓 Claude 從 RSS 清單中挑出最重要的 5 篇"""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    today  = datetime.now(TAIWAN_TZ).strftime("%Y年%m月%d日")
-
-    article_list = "\n".join([f"{i+1}. {a}" for i, a in enumerate(articles)])
-
-    prompt = f"""
-今天是 {today}。以下是從各科技媒體 RSS 抓到的最新文章清單：
-
-{article_list}
-
-請從中挑出「本週最重要、最值得科技人和商學院學生關注」的 5 篇。
-
-只輸出以下格式，不要寫任何其他文字：
-
-1. 新聞標題 | 完整網址
-2. 新聞標題 | 完整網址
-3. 新聞標題 | 完整網址
-4. 新聞標題 | 完整網址
-5. 新聞標題 | 完整網址
-
-標題和網址直接從上面清單複製，不可修改。
-"""
-
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    for block in response.content:
-        if block.type == "text":
-            return block.text.strip()
-    return ""
-
-
-def write_report_with_urls(url_list_text):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    today  = datetime.now(TAIWAN_TZ).strftime("%Y年%m月%d日")
-
-    prompt = f"""
-你是「黛安娜」，固定在每週五晚上為一群商學院學生與工程師撰寫科技週報的編輯。
-今天是 {today}。
-
-以下是本週 5 則科技新聞的標題和真實網址：
-
-{url_list_text}
-
-請根據這些新聞，撰寫本週的《黛安娜的科技蟹蟹水果報》。
-
-【語氣要求】
-- 繁體中文。語氣輕鬆自然但不輕浮，像懂產業的朋友在解說。
-- 幽默感來自觀察和措辭，不靠賣萌，不加感嘆號。
-- 不使用任何 emoji 或表情符號。
-- 禁用詞：值得關注、深刻影響、不容忽視、劃時代、引領未來。
-
-【讀者】
-- 一半商學院：關心產業趨勢、商業模式、競爭格局、投資方向。
-- 一半工程師：關心工具變化、技術方向、開發工作流、基礎設施。
-
-【輸出格式，嚴格照做】
-
-黛安娜的科技蟹蟹水果報｜本週科技趨勢整理
-
-開場：
-2-3 句，點出這週科技圈的主旋律。要有觀察感，不要是流水帳。
-
-本週 5 大趨勢：
-
-1. 新聞標題
-發生什麼：一句話說清楚核心。
-商業視角：對市場、商業模式、投資邏輯的意義，1-2 句。
-科技視角：對開發者、技術選型、工作流程的意義，1-2 句。
-來源：媒體名稱 網址直接貼，不加任何括號或標點符號，例如：來源：TechCrunch https://techcrunch.com/...
-
-2. 新聞標題
-發生什麼：
-商業視角：
-科技視角：
-來源：
-
-3. 新聞標題
-發生什麼：
-商業視角：
-科技視角：
-來源：
-
-4. 新聞標題
-發生什麼：
-商業視角：
-科技視角：
-來源：
-
-5. 新聞標題
-發生什麼：
-商業視角：
-科技視角：
-來源：
-
-本週觀察：
-2-3 句總結，這週主旋律是什麼、接下來最值得追什麼。要有自己的觀點。
-"""
-
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    all_text = []
-    for block in response.content:
-        if block.type == "text":
-            all_text.append(block.text)
-    return "\n".join(all_text) if all_text else "無法取得內容"
-
-
-def post_to_discord(news_text):
+def tool_post_discord(content: str) -> str:
+    """把完成的週報發送到 Discord"""
     today    = datetime.now(TAIWAN_TZ).strftime("%Y/%m/%d")
     week_num = datetime.now(TAIWAN_TZ).isocalendar()[1]
     LIMIT    = 3800
 
-    chunks = [news_text] if len(news_text) <= LIMIT else [
-        news_text[:news_text.rfind("\n", 0, LIMIT)],
-        news_text[news_text.rfind("\n", 0, LIMIT):].strip()
+    chunks = [content] if len(content) <= LIMIT else [
+        content[:content.rfind("\n", 0, LIMIT)],
+        content[content.rfind("\n", 0, LIMIT):].strip()
     ]
 
     for i, chunk in enumerate(chunks):
@@ -196,22 +70,164 @@ def post_to_discord(news_text):
             }]
         }
         resp = requests.post(DISCORD_WEBHOOK_URL, json=payload)
-        print(f"發送成功（第 {i+1} 則）" if resp.status_code in (200, 204)
-              else f"失敗：{resp.status_code} — {resp.text}")
+        if resp.status_code not in (200, 204):
+            return f"Discord 發送失敗：HTTP {resp.status_code} — {resp.text}"
+
+    return f"成功發送（共 {len(chunks)} 則訊息）"
+
+
+# ── Tool Schema（告訴 Claude 有哪些工具可以用）────────────
+
+TOOLS = [
+    {
+        "name": "fetch_rss",
+        "description": (
+            "抓取指定科技媒體的最新文章清單，回傳標題和完整網址。"
+            "可用來源：TechCrunch, The Verge, Wired, Ars Technica, iThome。"
+            "每個來源需要分別呼叫一次。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "媒體名稱，必須完全符合可用來源之一"
+                }
+            },
+            "required": ["source"]
+        }
+    },
+    {
+        "name": "post_discord",
+        "description": (
+            "把完成的週報內容發送到 Discord。"
+            "只在週報完整寫好之後才呼叫，不要在還在蒐集資料時呼叫。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "完整的週報文字，包含開場、5 則新聞分析、本週觀察"
+                }
+            },
+            "required": ["content"]
+        }
+    }
+]
+
+
+# ── Tool 執行器（把 Claude 的呼叫對應到實際函式）──────────
+
+def execute_tool(name: str, inputs: dict) -> str:
+    if name == "fetch_rss":
+        result = tool_fetch_rss(inputs["source"])
+        print(f"  ✓ fetch_rss({inputs['source']}): 取得 {result.count(chr(10))+1} 篇")
+        return result
+    elif name == "post_discord":
+        result = tool_post_discord(inputs["content"])
+        print(f"  ✓ post_discord: {result}")
+        return result
+    return f"未知工具：{name}"
+
+
+# ── Agent 主迴圈────────────────────────────────────────────
+
+def run_agent():
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    today  = datetime.now(TAIWAN_TZ).strftime("%Y年%m月%d日")
+
+    system_prompt = """你是「黛安娜」，每週為商學院學生與工程師撰寫科技週報的編輯。
+
+語氣要求：
+- 繁體中文，輕鬆自然但不輕浮，像懂產業的朋友在解說
+- 幽默感來自觀察和措辭，不靠賣萌，不加感嘆號
+- 不使用任何 emoji 或表情符號
+- 禁用詞：值得關注、深刻影響、不容忽視、劃時代、引領未來
+
+來源規則：
+- 每個 fetch_rss 只能抓一個來源，需要逐一呼叫
+- 網址直接貼，不加任何括號、Markdown 格式或標點符號
+  正確：來源：TechCrunch https://techcrunch.com/2026/04/04/example
+  錯誤：來源：TechCrunch [https://...](https://...)"""
+
+    user_prompt = f"""今天是 {today}。
+
+請完成以下任務：
+1. 用 fetch_rss 逐一抓取所有 5 個來源的文章（TechCrunch, The Verge, Wired, Ars Technica, iThome）
+2. 從中挑出最重要、最值得科技人和商學院學生關注的 5 篇
+3. 撰寫本週的《黛安娜的科技蟹蟹水果報》，格式如下：
+
+黛安娜的科技蟹蟹水果報｜本週科技趨勢整理
+
+開場：
+（2-3 句，點出本週主旋律，有觀察感）
+
+本週 5 大趨勢：
+
+1. 新聞標題
+發生什麼：（一句話說清楚核心）
+商業視角：（對市場、商業模式、投資邏輯的意義，1-2 句）
+科技視角：（對開發者、技術選型、工作流程的意義，1-2 句）
+來源：媒體名稱 網址
+
+（以此類推到第 5 則）
+
+本週觀察：
+（2-3 句，有自己的觀點）
+
+4. 週報寫完後，用 post_discord 發送。"""
+
+    messages = [{"role": "user", "content": user_prompt}]
+
+    print("Agent 啟動，開始執行任務...")
+    print("=" * 50)
+
+    iteration = 0
+    max_iterations = 20  # 防止無限迴圈
+
+    while iteration < max_iterations:
+        iteration += 1
+
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            system=system_prompt,
+            tools=TOOLS,
+            messages=messages
+        )
+
+        # 把 Claude 的回應加進對話歷史
+        messages.append({"role": "assistant", "content": response.content})
+
+        # 任務完成，結束迴圈
+        if response.stop_reason == "end_turn":
+            print("\n✓ Agent 完成所有任務")
+            break
+
+        # Claude 要呼叫 tool
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"\nStep {iteration}：呼叫 {block.name}")
+                    result = execute_tool(block.name, block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result
+                    })
+
+            # 把 tool 結果還給 Claude，讓它決定下一步
+            messages.append({"role": "user", "content": tool_results})
+
+        else:
+            print(f"意外的 stop_reason：{response.stop_reason}")
+            break
+
+    if iteration >= max_iterations:
+        print("已達最大迭代次數，強制停止")
 
 
 if __name__ == "__main__":
-    print("Step 1：從 RSS 抓最新文章...")
-    articles = fetch_rss_articles()
-    print(f"共抓到 {len(articles)} 篇")
-
-    print("\nStep 2：Claude 挑選本週 Top 5...")
-    url_list = pick_top5_with_claude(articles)
-    print(url_list)
-
-    print("\nStep 3：撰寫週報...")
-    news = write_report_with_urls(url_list)
-    print(news)
-
-    print("\nStep 4：發送到 Discord...")
-    post_to_discord(news)
+    run_agent()
