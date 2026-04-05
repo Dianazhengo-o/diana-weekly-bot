@@ -3,15 +3,15 @@ import requests
 import os
 from datetime import datetime, timezone, timedelta
 
-# GitHub Actions 版：Key 從環境變數讀取，不寫死在程式碼裡
+# GitHub Actions 版：Key 從環境變數讀取
 ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 TAIWAN_TZ = timezone(timedelta(hours=8))
 
-
+# ── Step 1：專門搜尋，只輸出標題 + 真實 URL ──────────────────────────────
 def search_real_urls():
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    today  = datetime.now(TAIWAN_TZ).strftime("%Y年%m月%d日")
+    today  = datetime.now(TAIWAN_TZ).strftime('%Y年%m月%d日')
 
     prompt = f"""
 今天是 {today}。請搜尋「最近 7 天內最重要的 5 則科技新聞」。
@@ -36,21 +36,26 @@ def search_real_urls():
 """
 
     response = client.messages.create(
-        model="claude-opus-4-5",
+        model='claude-opus-4-5',
         max_tokens=1024,
-        tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 8}],
-        messages=[{"role": "user", "content": prompt}]
+        tools=[{
+            'type': 'web_search_20260209',
+            'name': 'web_search',
+            'max_uses': 8,
+        }],
+        messages=[{'role': 'user', 'content': prompt}]
     )
 
     for block in response.content:
-        if block.type == "text":
+        if block.type == 'text':
             return block.text.strip()
-    return ""
+    return ''
 
 
+# ── Step 2：拿到真實 URL 後，再讓 Claude 寫完整報告 ─────────────────────
 def write_report_with_urls(url_list_text):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    today  = datetime.now(TAIWAN_TZ).strftime("%Y年%m月%d日")
+    today  = datetime.now(TAIWAN_TZ).strftime('%Y年%m月%d日')
 
     prompt = f"""
 你是「黛安娜」，固定在每週五晚上為一群商學院學生與工程師撰寫科技週報的編輯。
@@ -116,43 +121,46 @@ def write_report_with_urls(url_list_text):
 """
 
     response = client.messages.create(
-        model="claude-opus-4-5",
+        model='claude-opus-4-5',
         max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{'role': 'user', 'content': prompt}]   # 這步不需要 web_search
     )
 
     all_text = []
     for block in response.content:
-        if block.type == "text":
+        if block.type == 'text':
             all_text.append(block.text)
-    return "\n".join(all_text) if all_text else "無法取得內容"
+    return '\n'.join(all_text) if all_text else '無法取得內容'
 
 
+# ── 發送到 Discord（超長自動拆兩則）────────────────────────────────────────
 def post_to_discord(news_text):
-    today    = datetime.now(TAIWAN_TZ).strftime("%Y/%m/%d")
+    today    = datetime.now(TAIWAN_TZ).strftime('%Y/%m/%d')
     week_num = datetime.now(TAIWAN_TZ).isocalendar()[1]
     LIMIT    = 3800
 
     chunks = [news_text] if len(news_text) <= LIMIT else [
-        news_text[:news_text.rfind("\n", 0, LIMIT)],
-        news_text[news_text.rfind("\n", 0, LIMIT):].strip()
+        news_text[:news_text.rfind('\n', 0, LIMIT)],
+        news_text[news_text.rfind('\n', 0, LIMIT):].strip()
     ]
 
     for i, chunk in enumerate(chunks):
-        tag = f" ({i+1}/{len(chunks)})" if len(chunks) > 1 else ""
+        tag = f' ({i+1}/{len(chunks)})' if len(chunks) > 1 else ''
         payload = {
-            "username": "黛安娜的科技蟹蟹水果報",
-            "embeds": [{
-                "title":       f"黛安娜的科技蟹蟹水果報  Week {week_num} | {today}{tag}",
-                "description": chunk,
-                "color":       0xC0392B,
-                "footer":      {"text": "Powered by Claude AI | 每週五 18:00 發布"},
-                "timestamp":   datetime.now(timezone.utc).isoformat()
+            'username': '黛安娜的科技蟹蟹水果報',
+            'embeds': [{
+                'title':       f'黛安娜的科技蟹蟹水果報  Week {week_num} | {today}{tag}',
+                'description': chunk,
+                'color':       0xC0392B,
+                'footer':      {'text': 'Powered by Claude AI | 每週五 18:00 發布'},
+                'timestamp':   datetime.now(timezone.utc).isoformat()
             }]
         }
         resp = requests.post(DISCORD_WEBHOOK_URL, json=payload)
-        print(f"發送成功（第 {i+1} 則）" if resp.status_code in (200, 204)
-              else f"失敗：{resp.status_code} — {resp.text}")
+        print(f'發送成功（第 {i+1} 則）' if resp.status_code in (200, 204)
+              else f'失敗：{resp.status_code} — {resp.text}')
+
+
 
 
 if __name__ == "__main__":
@@ -163,6 +171,11 @@ if __name__ == "__main__":
     print("\nStep 2：撰寫週報...")
     news = write_report_with_urls(url_list)
     print(news)
+    print(f"\n全文字數：{len(news)} 字")
 
     print("\nStep 3：發送到 Discord...")
     post_to_discord(news)
+
+        
+    
+
