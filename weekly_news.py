@@ -1,4 +1,5 @@
 import anthropic
+import re
 import requests
 import xml.etree.ElementTree as ET
 import os
@@ -7,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 
 ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
-TAIWAN_TZ  = timezone(timedelta(hours=8))
+TAIWAN_TZ   = timezone(timedelta(hours=8))
 MEMORY_FILE = "newsletter_memory.json"
 
 RSS_FEEDS = {
@@ -48,15 +49,25 @@ def tool_fetch_rss(source: str) -> str:
         return f"{source} 失敗：{e}"
 
 
+# FIX #2：改為迴圈切割，解決 rfind=-1 及只能切兩段的問題
+def _split_chunks(content: str, limit: int = 3800) -> list[str]:
+    chunks = []
+    while len(content) > limit:
+        cut = content.rfind("\n", 0, limit)
+        if cut == -1:       # 整段沒有換行，強制硬切
+            cut = limit
+        chunks.append(content[:cut])
+        content = content[cut:].strip()
+    if content:
+        chunks.append(content)
+    return chunks
+
+
 def tool_post_discord(content: str) -> str:
     today    = datetime.now(TAIWAN_TZ).strftime("%Y/%m/%d")
     week_num = datetime.now(TAIWAN_TZ).isocalendar()[1]
-    LIMIT    = 3800
+    chunks   = _split_chunks(content)
 
-    chunks = [content] if len(content) <= LIMIT else [
-        content[:content.rfind("\n", 0, LIMIT)],
-        content[content.rfind("\n", 0, LIMIT):].strip(),
-    ]
     for i, chunk in enumerate(chunks):
         tag = f" ({i+1}/{len(chunks)})" if len(chunks) > 1 else ""
         payload = {
@@ -78,11 +89,14 @@ def tool_post_discord(content: str) -> str:
 # ── Memory ────────────────────────────────────────────────
 
 def tool_load_memory() -> str:
-    """讀取過去 4 週的新聞標題，供 Claude 避免重複"""
     if not os.path.exists(MEMORY_FILE):
         return "尚無歷史記錄，這是第一期。"
-    with open(MEMORY_FILE, encoding="utf-8") as f:
-        data = json.load(f)
+    # FIX #7：捕捉 JSON 損壞，避免整個 pipeline crash
+    try:
+        with open(MEMORY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return "記憶檔案損壞，視為第一期重新開始。"
     recent = data[-4:]
     lines = []
     for week in recent:
@@ -93,11 +107,14 @@ def tool_load_memory() -> str:
 
 
 def tool_save_memory(titles: list[str]) -> str:
-    """把本週 5 則標題存入記憶（保留最近 12 週）"""
+    # FIX #7：同樣保護讀取端
     data = []
     if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(MEMORY_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = []
     now = datetime.now(TAIWAN_TZ)
     data.append({
         "week":   now.isocalendar()[1],
@@ -151,7 +168,6 @@ POST_DISCORD_TOOL = {
     },
 }
 
-
 # ════════════════════════════════════════════════════════════
 #  Tool 執行器
 # ════════════════════════════════════════════════════════════
@@ -169,14 +185,15 @@ def execute_tool(name: str, inputs: dict) -> str:
 
 
 # ════════════════════════════════════════════════════════════
-#  Reflection（獨立審稿函式）
+#  Reflection
 # ════════════════════════════════════════════════════════════
 
 CRITIC_SYSTEM = """你是資深科技媒體主編，負責審查週報草稿。
 審查標準（全部符合才算通過）：
 1. 禁用詞不得出現：值得關注、深刻影響、不容忽視、劃時代、引領未來
 2. 不得有任何 emoji 或表情符號
-3. 網址必須裸露貼出，不可使用 Markdown [文字](連結) 格式
+3. 網址必須裸露貼出，格式為「來源：媒體名稱 https://...」
+   不可使用 Markdown [文字](連結) 格式，也不可加任何括號包住網址
 4. 每則新聞必須同時包含「商業視角」和「科技視角」兩個段落
 5. 開場和本週觀察需有具體觀點，不能只是陳述事實的摘要
 
@@ -190,11 +207,11 @@ REVISED
 
 
 def reflect_on_draft(client: anthropic.Anthropic, draft: str, max_retries: int = 2) -> str:
-    """讓 Claude 扮演主編審稿，最多修改 max_retries 次，回傳最終稿件"""
     current = draft
     for attempt in range(max_retries + 1):
         resp = client.messages.create(
-            model="claude-opus-4-5",
+            # FIX #6：審稿是規則比對，sonnet 足夠，不需要 opus
+            model="claude-sonnet-4-5",
             max_tokens=4096,
             system=CRITIC_SYSTEM,
             messages=[{"role": "user", "content": f"請審查以下草稿：\n\n{current}"}],
@@ -222,11 +239,6 @@ def reflect_on_draft(client: anthropic.Anthropic, draft: str, max_retries: int =
 # ════════════════════════════════════════════════════════════
 
 class CollectorAgent:
-    """
-    職責：逐一呼叫 fetch_rss → 精選 7 篇候選文章
-    工具：只有 fetch_rss（不處理撰稿邏輯）
-    模型：haiku（任務單純，省成本）
-    """
 
     SYSTEM = """你是資料蒐集員，負責抓取 RSS 並精選文章。
 
@@ -240,6 +252,9 @@ class CollectorAgent:
 
 只輸出這 7 行，不加任何其他文字。"""
 
+    # FIX #4：加入 MAX_ITER 防止無限迴圈
+    MAX_ITER = 15
+
     def run(self, client: anthropic.Anthropic, today: str, memory_context: str) -> str:
         print("\n[Collector Agent] 開始蒐集文章...")
         messages = [{
@@ -250,7 +265,8 @@ class CollectorAgent:
                 "請逐一呼叫 fetch_rss 抓取全部 5 個來源，挑出 7 篇候選文章。"
             ),
         }]
-        while True:
+
+        for iteration in range(self.MAX_ITER):
             resp = client.messages.create(
                 model="claude-haiku-4-5",
                 max_tokens=2048,
@@ -263,7 +279,7 @@ class CollectorAgent:
             if resp.stop_reason == "end_turn":
                 for block in resp.content:
                     if hasattr(block, "text") and block.text.strip():
-                        print(f"  [Collector] 候選文章清單完成（{block.text.count(chr(10))+1} 篇）")
+                        print(f"  [Collector] 完成（{block.text.count(chr(10))+1} 篇候選）")
                         return block.text
                 return ""
 
@@ -279,14 +295,13 @@ class CollectorAgent:
                         })
                 messages.append({"role": "user", "content": tool_results})
 
+        print("  ! [Collector] 已達最大迭代次數，強制終止")
+        return ""
+
 
 class WriterAgent:
-    """
-    職責：根據候選文章清單撰寫完整週報
-    工具：無（純文字生成）
-    模型：opus（需要高品質文字）
-    """
 
+    # FIX #1：修正 system prompt 中自相矛盾的網址範例
     SYSTEM = """你是「黛安娜」，每週為商學院學生與工程師撰寫科技週報的編輯。
 
 語氣要求：
@@ -295,10 +310,10 @@ class WriterAgent:
 - 不使用任何 emoji 或表情符號
 - 禁用詞：值得關注、深刻影響、不容忽視、劃時代、引領未來
 
-網址格式規則：
+網址格式規則（嚴格遵守）：
 - 網址直接貼出，不加任何括號或 Markdown 格式
 - 正確：來源：TechCrunch https://techcrunch.com/2026/04/04/example
-- 錯誤：來源：TechCrunch [https://...](https://...)"""
+- 錯誤：來源：TechCrunch [https://techcrunch.com/...](https://techcrunch.com/...)"""
 
     NEWSLETTER_FORMAT = """黛安娜的科技蟹蟹水果報｜本週科技趨勢整理
 
@@ -311,7 +326,7 @@ class WriterAgent:
 發生什麼：（一句話說清楚核心）
 商業視角：（對市場、商業模式、投資邏輯的意義，1-2 句）
 科技視角：（對開發者、技術選型、工作流程的意義，1-2 句）
-來源：媒體名稱 網址
+來源：媒體名稱 https://完整網址
 
 （以此類推到第 5 則）
 
@@ -340,14 +355,10 @@ class WriterAgent:
 
 
 # ════════════════════════════════════════════════════════════
-#  Orchestrator（主控）
+#  Orchestrator
 # ════════════════════════════════════════════════════════════
 
 class OrchestratorAgent:
-    """
-    協調順序：
-      load_memory → Collector → Writer → Reflection → post_discord → save_memory
-    """
 
     def run(self):
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -363,46 +374,66 @@ class OrchestratorAgent:
         preview = memory_context[:120] + "..." if len(memory_context) > 120 else memory_context
         print(f"  {preview}")
 
-        # ── Step 2：Collector ────────────────────────────────
+        # ── Step 2：Collector ─────────────────────────────────
+        # FIX #8：每個 Step 獨立 try/except，失敗時明確說明死在哪
         print("\n[Step 2] Collector Agent 蒐集候選文章")
-        articles = CollectorAgent().run(client, today, memory_context)
-        if not articles:
-            print("  ! Collector 未回傳任何文章，終止。")
+        try:
+            articles = CollectorAgent().run(client, today, memory_context)
+        except Exception as e:
+            print(f"  ! [Step 2] Collector 失敗：{e}")
             return
 
-        # ── Step 3：Writer ───────────────────────────────────
+        # FIX #5：驗證 Collector 回傳是否足夠，不夠就提早終止
+        if not articles or articles.count("\n") < 3:
+            print("  ! [Step 2] Collector 回傳文章不足（少於 4 篇），終止 Pipeline。")
+            return
+
+        # ── Step 3：Writer ────────────────────────────────────
         print("\n[Step 3] Writer Agent 撰寫週報")
-        draft = WriterAgent().run(client, today, articles)
+        try:
+            draft = WriterAgent().run(client, today, articles)
+        except Exception as e:
+            print(f"  ! [Step 3] Writer 失敗：{e}")
+            return
 
-        # ── Step 4：Reflection ───────────────────────────────
+        # ── Step 4：Reflection ────────────────────────────────
         print("\n[Step 4] Reflection 審稿")
-        final_draft = reflect_on_draft(client, draft)
+        try:
+            final_draft = reflect_on_draft(client, draft)
+        except Exception as e:
+            print(f"  ! [Step 4] Reflection 失敗，使用未審稿的草稿：{e}")
+            final_draft = draft   # 降級：直接用原稿
 
-        # ── Step 5：發送 Discord ─────────────────────────────
+        # ── Step 5：發送 Discord ──────────────────────────────
         print("\n[Step 5] 發送到 Discord")
-        result = tool_post_discord(final_draft)
-        print(f"  {result}")
+        try:
+            result = tool_post_discord(final_draft)
+            print(f"  {result}")
+        except Exception as e:
+            print(f"  ! [Step 5] Discord 發送失敗：{e}")
+            return
 
-        # ── Step 6：儲存記憶 ─────────────────────────────────
+        # ── Step 6：儲存記憶 ──────────────────────────────────
         print("\n[Step 6] 儲存本週標題到記憶")
-        titles = _extract_titles(final_draft)
-        save_result = tool_save_memory(titles)
-        print(f"  {save_result}")
+        try:
+            titles     = _extract_titles(final_draft)
+            save_result = tool_save_memory(titles)
+            print(f"  {save_result}")
+        except Exception as e:
+            print(f"  ! [Step 6] 記憶儲存失敗（不影響已發送的週報）：{e}")
 
         print("\n" + "=" * 55)
         print("  Pipeline 完成")
         print("=" * 55)
 
 
+# FIX #3：用正則表達式，正確處理一位數和兩位數編號
 def _extract_titles(newsletter: str) -> list[str]:
-    """從週報中解析 5 則新聞標題（取數字開頭的行）"""
     titles = []
     for line in newsletter.splitlines():
-        stripped = line.strip()
-        if stripped and stripped[0].isdigit() and "." in stripped[:3]:
-            title = stripped.lstrip("0123456789. ").strip()
-            if title:
-                titles.append(title)
+        m = re.match(r"^\d+[.．]\s+(.+)", line.strip())
+        if m:
+            titles.append(m.group(1).strip())
         if len(titles) >= 5:
             break
     return titles
